@@ -1,0 +1,29 @@
+{
+  "schemaVersion": 1,
+  "modelName": "no-warthunder-tiny",
+  "policyVersion": "nwt-ace-v3",
+  "trainingSeed": 1550111,
+  "trained": true,
+  "difficulty": "ace",
+  "observationVersion": 2,
+  "normalizationVersion": 2,
+  "inputSize": 320,
+  "hiddenSizes": [
+    64,
+    32
+  ],
+  "outputSize": 10,
+  "activation": "relu",
+  "actionEncoding": "move*2+fire",
+  "decisionHz": 10,
+  "observationDelayDecisions": 2,
+  "weightsFile": "weights.bin",
+  "weightsFormat": "float32-le",
+  "weightsLayout": "out-in-row-major-weights-then-bias",
+  "weightsSHA256": "c1c1a63b158676173ab3125f0f1c9eac249942b93e0caed1853f48fda93ef0f9",
+  "sampler": {
+    "mode": "categorical",
+    "temperature": 0.5,
+    "rng": "xorshift64-v1"
+  }
+}

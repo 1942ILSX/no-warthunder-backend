@@ -3,9 +3,11 @@
 package server
 
 import (
+	"BattleCityReforge/internal/difficulty"
 	"BattleCityReforge/internal/game"
 	"BattleCityReforge/internal/leaderboard"
 	"BattleCityReforge/internal/levels"
+	"BattleCityReforge/internal/policymlp"
 	"context"
 	"crypto/rand"
 	"crypto/subtle"
@@ -38,6 +40,9 @@ type Config struct {
 	AllowedOrigins []string
 	FrontendDir    string
 	Logger         *slog.Logger
+	// Policies are loaded once at startup and shared across rooms. A missing
+	// policy rejects room creation rather than silently changing its difficulty.
+	Policies map[difficulty.ID]game.Policy
 }
 type Server struct {
 	config   Config
@@ -51,10 +56,13 @@ type Server struct {
 	upgrader websocket.Upgrader
 }
 type room struct {
-	id, token string
-	level     levels.Level
-	created   time.Time
-	claimed   bool
+	id, token     string
+	level         levels.Level
+	created       time.Time
+	claimed       bool
+	profile       difficulty.Profile
+	policy        game.Policy
+	policyVersion string
 }
 type receipt struct {
 	LevelID              int
@@ -62,17 +70,46 @@ type receipt struct {
 	DurationMS           int64
 	CompletedAt, Expires time.Time
 	Submitting           bool
+	RunMetadata          leaderboard.RunMetadata
 }
 type result struct {
-	Status          string `json:"status"`
-	LevelID         int    `json:"levelId"`
-	Score           int    `json:"score"`
-	DurationMS      int64  `json:"durationMs"`
-	Kills           int    `json:"kills"`
-	CompletionToken string `json:"completionToken,omitempty"`
+	Status          string        `json:"status"`
+	LevelID         int           `json:"levelId"`
+	Score           int           `json:"score"`
+	DurationMS      int64         `json:"durationMs"`
+	Kills           int           `json:"kills"`
+	CompletionToken string        `json:"completionToken,omitempty"`
+	Difficulty      difficulty.ID `json:"difficulty"`
+	ScoreMultiplier float64       `json:"scoreMultiplier"`
+	BaseScore       int           `json:"baseScore"`
+	PolicyVersion   string        `json:"policyVersion"`
+}
+
+// Only transport scores are weighted. The simulation and training environment
+// always retain their original base score, so snapshots cannot compound it.
+type roomState struct {
+	game.State
+	BaseScore int `json:"baseScore"`
+}
+
+func (rm *room) state(state game.State) roomState {
+	base := state.Score
+	state.Score = rm.profile.ApplyScore(base)
+	return roomState{State: state, BaseScore: base}
+}
+
+func (rm *room) result(state game.State, durationMS int64) result {
+	return result{Status: state.Status, LevelID: rm.level.ID, Score: rm.profile.ApplyScore(state.Score),
+		BaseScore: state.Score, DurationMS: max(durationMS, 1), Kills: state.Kills,
+		Difficulty: rm.profile.ID, ScoreMultiplier: rm.profile.ScoreMultiplier, PolicyVersion: rm.policyVersion}
 }
 
 func New(config Config, store *leaderboard.Store) *Server {
+	policies := make(map[difficulty.ID]game.Policy, len(config.Policies))
+	for id, policy := range config.Policies {
+		policies[id] = policy
+	}
+	config.Policies = policies
 	if config.MaxRooms <= 0 {
 		config.MaxRooms = 25
 	}
@@ -97,6 +134,9 @@ func (s *Server) Close() {
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.health)
+	mux.HandleFunc("GET /api/difficulties", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, 200, map[string]any{"defaultDifficulty": difficulty.Default, "difficulties": difficulty.All()})
+	})
 	mux.HandleFunc("GET /api/levels", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{"levels": levels.All()})
 	})
@@ -156,7 +196,8 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 }
 func (s *Server) createRoom(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		LevelID int `json:"levelId"`
+		LevelID    int     `json:"levelId"`
+		Difficulty *string `json:"difficulty"`
 	}
 	if err := readJSON(w, r, &body); err != nil {
 		fail(w, 400, "invalid_level", "Expected a valid levelId")
@@ -166,6 +207,24 @@ func (s *Server) createRoom(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		fail(w, 400, "invalid_level", "Choose a level from 1 to 10")
 		return
+	}
+	choice := string(difficulty.Default)
+	if body.Difficulty != nil {
+		choice = *body.Difficulty
+	}
+	profile, ok := difficulty.Parse(choice)
+	if !ok {
+		fail(w, 400, "invalid_difficulty", "Choose trainee, expert or ace")
+		return
+	}
+	policy := s.config.Policies[profile.ID]
+	if policy == nil {
+		fail(w, 503, "policy_unavailable", "The selected difficulty model is unavailable")
+		return
+	}
+	policyVersion := policy.Name()
+	if model, ok := policy.(interface{ Metadata() policymlp.Metadata }); ok {
+		policyVersion = model.Metadata().PolicyVersion
 	}
 	id, err := randomToken(12)
 	if err != nil {
@@ -195,9 +254,10 @@ func (s *Server) createRoom(w http.ResponseWriter, r *http.Request) {
 		fail(w, 503, "run_capacity_full", "Run capacity is temporarily full. Please try again shortly.")
 		return
 	}
-	s.rooms[id] = &room{id: id, token: token, level: level, created: time.Now()}
+	s.rooms[id] = &room{id: id, token: token, level: level, created: time.Now(), profile: profile, policy: policy, policyVersion: policyVersion}
 	s.mu.Unlock()
-	writeJSON(w, 201, map[string]string{"roomId": id, "token": token, "wsUrl": "/api/rooms/" + id + "/ws?token=" + token})
+	writeJSON(w, 201, map[string]any{"roomId": id, "token": token, "wsUrl": "/api/rooms/" + id + "/ws?token=" + token,
+		"difficulty": profile.ID, "scoreMultiplier": profile.ScoreMultiplier, "policyVersion": policyVersion})
 }
 func (s *Server) connect(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
@@ -279,12 +339,14 @@ func (s *Server) runRoom(conn *websocket.Conn, rm *room) {
 		seed = seed*31 + int64(c)
 	}
 	g := game.New(rm.level, seed)
+	g.SetPolicy(rm.policy)
 	started := time.Now()
 	send := func(message any) bool {
 		_ = conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
 		return conn.WriteJSON(message) == nil
 	}
-	if !send(map[string]any{"type": "welcome", "roomId": rm.id, "level": rm.level, "state": g.Snapshot()}) {
+	if !send(map[string]any{"type": "welcome", "roomId": rm.id, "level": rm.level, "state": rm.state(g.Snapshot()),
+		"difficulty": rm.profile.ID, "scoreMultiplier": rm.profile.ScoreMultiplier, "policyVersion": rm.policyVersion}) {
 		return
 	}
 	ticker := time.NewTicker(time.Second / 30)
@@ -313,7 +375,8 @@ func (s *Server) runRoom(conn *websocket.Conn, rm *room) {
 		case now := <-ticker.C:
 			if now.Sub(started) > roomTTL {
 				state := g.Snapshot()
-				send(map[string]any{"type": "finished", "result": result{Status: "lost", LevelID: rm.level.ID, Score: state.Score, DurationMS: now.Sub(started).Milliseconds(), Kills: state.Kills}})
+				state.Status = "lost"
+				send(map[string]any{"type": "finished", "result": rm.result(state, now.Sub(started).Milliseconds())})
 				return
 			}
 			if now.Sub(lastInput) > 500*time.Millisecond {
@@ -335,17 +398,18 @@ func (s *Server) runRoom(conn *websocket.Conn, rm *room) {
 			}
 			state := g.Snapshot()
 			state.TimeMS = now.Sub(started).Milliseconds()
-			if !send(map[string]any{"type": "state", "state": state}) {
+			if !send(map[string]any{"type": "state", "state": rm.state(state)}) {
 				return
 			}
 			if state.Status != "playing" {
-				final := result{Status: state.Status, LevelID: rm.level.ID, Score: state.Score, DurationMS: max(state.TimeMS, 1), Kills: state.Kills}
+				final := rm.result(state, state.TimeMS)
 				if state.Status == "won" {
 					token, err := randomToken(32)
 					if err == nil {
 						s.mu.Lock()
 						if len(s.receipts) < maxReceipts {
-							s.receipts[token] = &receipt{LevelID: rm.level.ID, Score: final.Score, DurationMS: final.DurationMS, CompletedAt: now, Expires: now.Add(completionTTL)}
+							s.receipts[token] = &receipt{LevelID: rm.level.ID, Score: final.Score, DurationMS: final.DurationMS, CompletedAt: now, Expires: now.Add(completionTTL),
+								RunMetadata: leaderboard.RunMetadata{Difficulty: final.Difficulty, ScoreMultiplier: final.ScoreMultiplier, BaseScore: final.BaseScore}}
 							final.CompletionToken = token
 						}
 						s.mu.Unlock()
@@ -394,7 +458,7 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 	}
 	rc.Submitting = true
 	s.mu.Unlock()
-	rank, recorded, entries, err := s.store.Submit(rc.LevelID, id, rc.Score, rc.DurationMS, rc.CompletedAt)
+	rank, recorded, entries, err := s.store.Submit(rc.LevelID, id, rc.Score, rc.DurationMS, rc.CompletedAt, rc.RunMetadata)
 	s.mu.Lock()
 	if err != nil {
 		rc.Submitting = false

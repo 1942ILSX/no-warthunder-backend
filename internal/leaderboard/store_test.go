@@ -1,6 +1,9 @@
 package leaderboard
 
 import (
+	"BattleCityReforge/internal/difficulty"
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -104,5 +107,82 @@ func TestFailedPersistenceDoesNotPublishRecord(t *testing.T) {
 	}
 	if len(s.Entries(1)) != 0 {
 		t.Fatal("failed write became visible")
+	}
+}
+
+func TestDifficultyMetadataAndLegacyRecordsShareOneTopTen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "scores.json")
+	store, err := New(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if _, _, _, err := store.Submit(1, "legacy", 9999, 1000, now); err != nil {
+		t.Fatal(err)
+	}
+	for index := range 18 {
+		profile := difficulty.All()[index%3]
+		base := 100 + index
+		metadata := RunMetadata{Difficulty: profile.ID, ScoreMultiplier: profile.ScoreMultiplier, BaseScore: base}
+		if _, _, _, err := store.Submit(1, fmt.Sprintf("run-%d", index), profile.ApplyScore(base), int64(2000+index), now, metadata); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Equal weighted scores from different tiers are ordered by speedrun time.
+	if _, _, _, err := store.Submit(1, "slow-ace", 600, 4000, now, RunMetadata{Difficulty: difficulty.Ace, ScoreMultiplier: 2, BaseScore: 300}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := store.Submit(1, "fast-expert", 600, 3000, now, RunMetadata{Difficulty: difficulty.Expert, ScoreMultiplier: 1.5, BaseScore: 400}); err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := New(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	records := reloaded.Entries(1)
+	if len(records) != Limit || records[0].ID != "legacy" || records[1].ID != "fast-expert" || records[2].ID != "slow-ace" {
+		t.Fatalf("wrong mixed top ten: %+v", records)
+	}
+	if records[0].RunMetadata != (RunMetadata{}) {
+		t.Fatal("legacy record relabeled as a trained tier")
+	}
+	if records[1].BaseScore != 400 || records[1].Difficulty != difficulty.Expert || records[1].ScoreMultiplier != 1.5 {
+		t.Fatalf("metadata lost: %+v", records[1])
+	}
+	data, err := json.Marshal(records[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(data, []byte("difficulty")) || bytes.Contains(data, []byte("scoreMultiplier")) {
+		t.Fatalf("legacy metadata fabricated: %s", data)
+	}
+}
+
+func TestInvalidDifficultyMetadataCannotBeStoredOrLoaded(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "scores.json")
+	store, _ := New(path)
+	for _, metadata := range []RunMetadata{
+		{Difficulty: difficulty.Ace, ScoreMultiplier: 99, BaseScore: 100},
+		{Difficulty: difficulty.Expert, ScoreMultiplier: 1.5, BaseScore: 100},
+		{Difficulty: "unknown", ScoreMultiplier: 2, BaseScore: 100},
+		{BaseScore: 100},
+	} {
+		if _, _, _, err := store.Submit(1, "pilot", 200, 1000, time.Now(), metadata); err == nil {
+			t.Fatalf("accepted inconsistent metadata: %+v", metadata)
+		}
+	}
+	if len(store.Entries(1)) != 0 {
+		t.Fatal("invalid metadata published")
+	}
+	invalid := []byte(`{"version":1,"levels":{"1":[{"id":"pilot","score":200,"durationMs":1000,"completedAt":"2026-10-28T00:00:00Z","difficulty":"expert","scoreMultiplier":1.5,"baseScore":100}]}}`)
+	if err := os.WriteFile(path, invalid, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := New(path); err == nil {
+		t.Fatal("loaded inconsistent score metadata")
+	}
+	unchanged, _ := os.ReadFile(path)
+	if !bytes.Equal(unchanged, invalid) {
+		t.Fatal("corrupt original overwritten")
 	}
 }

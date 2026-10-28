@@ -131,6 +131,8 @@ type Game struct {
 	navBase        [BoardSize][BoardSize]float32
 	navPlayerCell  int
 	navDirty       bool
+	decisionHook   DecisionHook // nil in production; no training channels in Game
+	decisionSlots  [DecisionSlots]int
 }
 
 var directionX = [4]float64{0, 1, 0, -1}

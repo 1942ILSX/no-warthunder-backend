@@ -251,7 +251,7 @@ func TestObservationSchemaFiniteAndInputPrivate(t *testing.T) {
 	if !ok {
 		t.Fatal("observation unavailable")
 	}
-	if o.Version != 1 || len(o.Values) != 320 {
+	if o.Version != ObservationVersion || len(o.Values) != 320 {
 		t.Fatal("observation schema changed without version update")
 	}
 	for i, v := range o.Values {

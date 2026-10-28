@@ -1,6 +1,7 @@
 package main
 
 import (
+	"BattleCityReforge/internal/difficulty"
 	"BattleCityReforge/internal/leaderboard"
 	"BattleCityReforge/internal/levels"
 	"BattleCityReforge/internal/server"
@@ -23,6 +24,14 @@ func main() {
 			os.Exit(1)
 		}
 	}
+	// Fail before opening a listener if any release artifact is missing or has
+	// changed. All rooms share these three immutable, validated Go models.
+	modelsDir := env("MODELS_DIR", "models")
+	policies, err := difficulty.LoadPolicies(modelsDir)
+	if err != nil {
+		logger.Error("qualified models unavailable", "directory", modelsDir, "error", err)
+		os.Exit(1)
+	}
 	store, err := leaderboard.New(env("LEADERBOARD_FILE", "data/leaderboard.json"))
 	if err != nil {
 		logger.Error("leaderboard unavailable", "error", err)
@@ -38,7 +47,7 @@ func main() {
 		logger.Error("MAX_ROOMS must be between 1 and 100")
 		os.Exit(1)
 	}
-	app := server.New(server.Config{MaxRooms: maxRooms, AllowedOrigins: strings.Split(env("ALLOWED_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173"), ","), FrontendDir: front, Logger: logger}, store)
+	app := server.New(server.Config{MaxRooms: maxRooms, AllowedOrigins: strings.Split(env("ALLOWED_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173"), ","), FrontendDir: front, Logger: logger, Policies: policies}, store)
 	defer app.Close()
 	httpServer := &http.Server{Addr: env("ADDR", "127.0.0.1:8080"), Handler: app.Handler(), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 8192}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -50,7 +59,7 @@ func main() {
 		app.Close()
 		_ = httpServer.Shutdown(shutdown)
 	}()
-	logger.Info("NO WarThunder ready", "address", httpServer.Addr, "maxRooms", maxRooms)
+	logger.Info("NO WarThunder ready", "address", httpServer.Addr, "maxRooms", maxRooms, "models", modelsDir, "defaultDifficulty", difficulty.Default)
 	if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		logger.Error("server stopped", "error", err)
 		os.Exit(1)

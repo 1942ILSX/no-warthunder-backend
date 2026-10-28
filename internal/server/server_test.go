@@ -9,11 +9,14 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"BattleCityReforge/internal/difficulty"
 	"BattleCityReforge/internal/game"
 	"BattleCityReforge/internal/leaderboard"
+	"BattleCityReforge/internal/levels"
 	"github.com/gorilla/websocket"
 )
 
@@ -23,7 +26,11 @@ func testServer(t *testing.T, maxRooms int) (*Server, *httptest.Server) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	app := New(Config{MaxRooms: maxRooms, AllowedOrigins: []string{"http://localhost:5173"}}, store)
+	policies := make(map[difficulty.ID]game.Policy)
+	for _, profile := range difficulty.All() {
+		policies[profile.ID] = game.ScriptedPolicy{}
+	}
+	app := New(Config{MaxRooms: maxRooms, AllowedOrigins: []string{"http://localhost:5173"}, Policies: policies}, store)
 	ts := httptest.NewServer(app.Handler())
 	t.Cleanup(func() { app.Close(); ts.Close() })
 	return app, ts
@@ -45,11 +52,11 @@ func reserve(t *testing.T, ts *httptest.Server) map[string]string {
 	if code != 201 {
 		t.Fatalf("reserve=%d %s", code, data)
 	}
-	var reservation map[string]string
+	var reservation struct{ RoomID, Token, WSURL string }
 	if err := json.Unmarshal(data, &reservation); err != nil {
 		t.Fatal(err)
 	}
-	return reservation
+	return map[string]string{"roomId": reservation.RoomID, "token": reservation.Token, "wsUrl": reservation.WSURL}
 }
 
 func TestErrorsExposeStableTranslationCodes(t *testing.T) {
@@ -286,5 +293,183 @@ func TestIdleInputStopsAndShutdownClosesSocket(t *testing.T) {
 	case <-closed:
 	case <-time.After(3 * time.Second):
 		t.Fatal("shutdown blocked on live websocket")
+	}
+}
+
+func TestDifficultyCatalogValidationAndDefault(t *testing.T) {
+	app, ts := testServer(t, 5)
+	response, err := ts.Client().Get(ts.URL + "/api/difficulties")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	var catalog struct {
+		DefaultDifficulty difficulty.ID        `json:"defaultDifficulty"`
+		Difficulties      []difficulty.Profile `json:"difficulties"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&catalog); err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != 200 || catalog.DefaultDifficulty != difficulty.Expert || len(catalog.Difficulties) != 3 {
+		t.Fatalf("wrong catalog: %+v", catalog)
+	}
+	reservation := reserve(t, ts)
+	app.mu.Lock()
+	rm := app.rooms[reservation["roomId"]]
+	app.mu.Unlock()
+	if rm.profile.ID != difficulty.Expert || rm.profile.ScoreMultiplier != 1.5 {
+		t.Fatalf("wrong default profile: %+v", rm.profile)
+	}
+	for _, invalid := range []string{"", "Expert", "impossible", " ace "} {
+		status, data := post(t, ts.URL+"/api/rooms", map[string]any{"levelId": 1, "difficulty": invalid})
+		if status != 400 || !bytes.Contains(data, []byte(`"code":"invalid_difficulty"`)) {
+			t.Fatalf("accepted invalid difficulty %q: %d %s", invalid, status, data)
+		}
+	}
+}
+
+func TestMissingPolicyNeverStartsScriptedRoom(t *testing.T) {
+	store, _ := leaderboard.New(filepath.Join(t.TempDir(), "scores.json"))
+	app := New(Config{}, store)
+	ts := httptest.NewServer(app.Handler())
+	defer ts.Close()
+	defer app.Close()
+	status, data := post(t, ts.URL+"/api/rooms", map[string]any{"levelId": 1, "difficulty": "ace"})
+	if status != 503 || !bytes.Contains(data, []byte(`"code":"policy_unavailable"`)) || len(app.rooms) != 0 {
+		t.Fatalf("missing policy accepted: %d %s", status, data)
+	}
+}
+
+type countingPolicy struct {
+	name      string
+	decisions atomic.Int64
+}
+
+func (p *countingPolicy) Name() string { return p.name }
+func (p *countingPolicy) Decide(_ game.Observation, _ *game.PolicyMemory) game.Action {
+	p.decisions.Add(1)
+	return game.Action{}
+}
+
+func TestRoomUsesLockedSelectedPolicy(t *testing.T) {
+	store, _ := leaderboard.New(filepath.Join(t.TempDir(), "scores.json"))
+	selected := &countingPolicy{name: "selected-ace"}
+	other := &countingPolicy{name: "other-expert"}
+	policies := map[difficulty.ID]game.Policy{difficulty.Ace: selected, difficulty.Expert: other}
+	app := New(Config{Policies: policies}, store)
+	ts := httptest.NewServer(app.Handler())
+	defer ts.Close()
+	defer app.Close()
+	// The caller cannot replace the server's policy map after construction.
+	policies[difficulty.Ace] = other
+	status, data := post(t, ts.URL+"/api/rooms", map[string]any{"levelId": 1, "difficulty": "ace"})
+	if status != 201 {
+		t.Fatalf("create room: %d %s", status, data)
+	}
+	var reservation struct {
+		WSURL           string        `json:"wsUrl"`
+		Difficulty      difficulty.ID `json:"difficulty"`
+		ScoreMultiplier float64       `json:"scoreMultiplier"`
+		PolicyVersion   string        `json:"policyVersion"`
+	}
+	if err := json.Unmarshal(data, &reservation); err != nil {
+		t.Fatal(err)
+	}
+	if reservation.Difficulty != difficulty.Ace || reservation.ScoreMultiplier != 2 || reservation.PolicyVersion != selected.Name() {
+		t.Fatalf("wrong reserved policy: %+v", reservation)
+	}
+	conn, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(ts.URL, "http")+reservation.WSURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	conn.SetReadDeadline(time.Now().Add(4 * time.Second))
+	var welcome struct {
+		Type            string        `json:"type"`
+		Difficulty      difficulty.ID `json:"difficulty"`
+		ScoreMultiplier float64       `json:"scoreMultiplier"`
+		PolicyVersion   string        `json:"policyVersion"`
+		State           roomState     `json:"state"`
+	}
+	if err := conn.ReadJSON(&welcome); err != nil {
+		t.Fatal(err)
+	}
+	if welcome.Type != "welcome" || welcome.Difficulty != difficulty.Ace || welcome.ScoreMultiplier != 2 || welcome.PolicyVersion != selected.Name() {
+		t.Fatalf("wrong welcome policy: %+v", welcome)
+	}
+	if err := conn.WriteJSON(map[string]any{"type": "input", "seq": 1, "move": 0, "fire": false, "difficulty": "expert", "scoreMultiplier": 99}); err != nil {
+		t.Fatal(err)
+	}
+	for selected.decisions.Load() == 0 {
+		var message map[string]json.RawMessage
+		if err := conn.ReadJSON(&message); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if other.decisions.Load() != 0 {
+		t.Fatal("client input changed selected policy")
+	}
+}
+
+func TestWeightedSnapshotsResultsAndTrustedSubmission(t *testing.T) {
+	app, ts := testServer(t, 1)
+	for _, profile := range difficulty.All() {
+		t.Run(string(profile.ID), func(t *testing.T) {
+			level, _ := levels.Get(1)
+			rm := &room{level: level, profile: profile, policyVersion: "test-" + string(profile.ID)}
+			raw := game.State{Score: 101, Status: "won", Kills: 3}
+			expected := map[difficulty.ID]int{difficulty.Trainee: 101, difficulty.Expert: 151, difficulty.Ace: 202}[profile.ID]
+			for range 3 {
+				data, err := json.Marshal(rm.state(raw))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if bytes.Count(data, []byte(`"score":`)) != 1 {
+					t.Fatalf("duplicate score field: %s", data)
+				}
+				var decoded map[string]any
+				if err := json.Unmarshal(data, &decoded); err != nil {
+					t.Fatal(err)
+				}
+				if decoded["score"] != float64(expected) || decoded["baseScore"] != float64(101) {
+					t.Fatalf("wrong weighted state: %s", data)
+				}
+			}
+			if raw.Score != 101 {
+				t.Fatal("transport changed raw simulation score")
+			}
+			final := rm.result(raw, 4321)
+			if final.Score != expected || final.BaseScore != 101 || final.Difficulty != profile.ID || final.ScoreMultiplier != profile.ScoreMultiplier || final.PolicyVersion != rm.policyVersion {
+				t.Fatalf("wrong final score: %+v", final)
+			}
+			now := time.Now()
+			token := string(profile.ID)
+			app.mu.Lock()
+			app.receipts[token] = &receipt{LevelID: 1, Score: final.Score, DurationMS: final.DurationMS, CompletedAt: now, Expires: now.Add(time.Minute),
+				RunMetadata: leaderboard.RunMetadata{Difficulty: profile.ID, ScoreMultiplier: profile.ScoreMultiplier, BaseScore: final.BaseScore}}
+			app.mu.Unlock()
+			for _, field := range []string{"score", "baseScore", "scoreMultiplier", "difficulty"} {
+				status, _ := post(t, ts.URL+"/api/leaderboard", map[string]any{"completionToken": token, "id": token, field: 999})
+				if status != 400 {
+					t.Fatalf("accepted client %s", field)
+				}
+			}
+			status, data := post(t, ts.URL+"/api/leaderboard", map[string]any{"completionToken": token, "id": token})
+			if status != 200 {
+				t.Fatalf("trusted submission: %d %s", status, data)
+			}
+			found := false
+			for _, record := range app.store.Entries(1) {
+				if record.ID == token {
+					found = true
+					if record.Score != expected || record.BaseScore != 101 || record.Difficulty != profile.ID || record.ScoreMultiplier != profile.ScoreMultiplier {
+						t.Fatalf("wrong stored score: %+v", record)
+					}
+				}
+			}
+			if !found {
+				t.Fatal("completed run missing")
+			}
+		})
 	}
 }

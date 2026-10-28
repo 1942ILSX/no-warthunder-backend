@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"BattleCityReforge/internal/difficulty"
 	"BattleCityReforge/internal/game"
 	"BattleCityReforge/internal/leaderboard"
 	"BattleCityReforge/internal/server"
@@ -59,11 +60,15 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	policies, err := difficulty.LoadPolicies("models")
+	if err != nil {
+		return err
+	}
 	listener, err := net.Listen("tcp", "127.0.0.1:18083")
 	if err != nil {
 		return fmt.Errorf("private QA port unavailable (existing server untouched): %w", err)
 	}
-	app := server.New(server.Config{MaxRooms: 3, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, store)
+	app := server.New(server.Config{MaxRooms: 3, Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), Policies: policies}, store)
 	httpServer := &http.Server{Handler: app.Handler(), ReadHeaderTimeout: 5 * time.Second}
 	go func() { _ = httpServer.Serve(listener) }()
 	defer func() { app.Close(); _ = httpServer.Close() }()
@@ -93,7 +98,7 @@ func play(limit time.Duration) (finalResult, error) {
 	var created struct {
 		WSURL string `json:"wsUrl"`
 	}
-	status, err := request(http.MethodPost, "/api/rooms", map[string]any{"levelId": 1}, &created)
+	status, err := request(http.MethodPost, "/api/rooms", map[string]any{"levelId": 1, "difficulty": difficulty.Trainee}, &created)
 	if err != nil {
 		return finalResult{}, err
 	}

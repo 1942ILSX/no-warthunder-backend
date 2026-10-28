@@ -1,8 +1,12 @@
-# Future tiny RL actor — integration contract
+# Tiny RL actor — integration contract
 
-The shipped opponent is **scripted-v1**, not a trained model. Offline training,
-weights, distillation, PPO/MAPPO, a Python environment adapter and a model loader
-are intentionally future work. The game is fully playable with the fallback.
+The server ships three qualified **native-v3** actors for Trainee, Expert and
+Ace, loaded from [models/](../models/README.md). Difficulty selection and score
+multipliers are integrated into the room API. The offline Go training worker
+exposes the same simulation and decision pipeline through
+[training protocol v1](TRAINING_PROTOCOL.md). Training remains separate from
+live rooms; `game.ScriptedPolicy` is retained for reference bots and bounded
+invalid-observation fallback, not as a substitute for a missing release model.
 
 ## Replacement seam
 
@@ -14,20 +18,24 @@ spawned enemy and must never be shared between enemies or rooms.
 
 The actor may read only its observation and memory. It must not read future
 player input, network state, wall-clock time or the mutable Game. No inference
-service is required. A small pure-Go MLP can implement this interface directly.
+service is required. `internal/policymlp` implements this interface with a pure-Go MLP.
 
-The baseline candidate is `320 → 64 → 32 → 10`, using ReLU hidden activations.
+The shipped actor is `320 → 64 → 32 → 10`, using ReLU hidden activations.
 It contains 22,954 parameters including biases, or 91,816 bytes of FP32 weights.
-This is a candidate, not a trained capability claim. Use the same observation
-contract for a larger teacher; a training-only critic may consume privileged
+See [validation](VALIDATION.md) for the qualification scope. Use the same
+observation contract for a larger teacher; a training-only critic may consume privileged
 state. A critic is never shipped to the game server.
 
-## Observation v1 (320 float32 values)
+## Observation v2 (320 float32 values)
 
 Coordinates are tile centres on a 24×24 board. Relative coordinates are divided
 by 24, velocity by player speed / player projectile speed respectively. Entity
 slots are zero-filled and carry an existence mask. Feature values are finite and
 lie in [-1,1]. Any schema or normalization change requires a new version.
+ObservationVersion and NormalizationVersion are both 2. Version 2 keeps the
+320-value shape and clamps player velocity: turning can snap the player back to
+a lane centre, producing an apparent displacement faster than normal movement.
+A v1 artifact is not accepted as v2 without re-export and parity validation.
 
 | Slice, zero based, end exclusive | Meaning |
 | --- | --- |
@@ -40,7 +48,7 @@ lie in [-1,1]. Any schema or normalization change requires a new version.
 | 11 | min(1, simulation elapsed / 180 seconds) |
 | 12:208 | 7×7 cells centred on floor(self position), row-major, four channels per cell: brick, steel, water, grass. Out of bounds = steel. Floor = all zero. |
 | 208:210 | Visible player's relative x,y / 24 |
-| 210:212 | Observed player velocity / 3.15 |
+| 210:212 | Observed player velocity / 3.15, clipped to [-1,1] |
 | 212 | Player HP |
 | 213:217 | Player facing one-hot |
 | 217:219 | Player visible and shield flags |
@@ -94,37 +102,70 @@ Movement actions remain valid at walls because turning to shoot the wall is
 meaningful. Fire actions are masked when the observed weapon is cooling or has
 an active projectile. Physical firing limits are rechecked against current
 state, since the actor's observation is delayed. Invalid move output becomes
-idle. Future inference must reject nonfinite logits and fall back safely.
+idle. The implemented inference adapter rejects invalid/nonfinite observations or
+logits and uses a bounded scripted fallback; see its artifact contract below.
 
-## Intended export format (loader not implemented yet)
+## Implemented loader, export format, and parity checker
 
-Use a versioned metadata document and little-endian FP32 weights. Metadata must
-include `observationVersion:1`, `inputSize:320`, `hiddenSizes:[64,32]`,
-`outputSize:10`, `activation:"relu"`, `actionEncoding:"move*2+fire"`,
-`decisionHz:10`, `observationDelayDecisions:2`, layer shapes, checksum, training
-seed and policy version. Each layer stores row-major `[output,input]` weights
-followed by output bias. Store normalization version explicitly; do not infer
-it from tensor dimensions. Load and validate once at startup.
+`internal/policymlp` provides a strict artifact loader, pure-Go FP32 inference,
+action-mask validation, deterministic argmax/categorical sampling, and a scripted
+fallback for invalid decision inputs. `cmd/policycheck` exposes logits, actions,
+and per-tank RNG state for cross-language parity checks, plus a local inference
+benchmark. The authoritative format, validation limits, sampling algorithm, and
+CLI examples are in the [model adapter contract](../internal/policymlp/README.md).
 
-TODO when a real model exists:
+Artifacts contain `metadata.json` and little-endian FP32 `weights.bin`. Supported
+actor shapes are `320→64→32→10` and `320→32→16→10`. Each layer stores row-major
+`[output,input]` weights followed by its output bias. Metadata explicitly records
+ObservationVersion2, NormalizationVersion2, the action encoding, 10Hz decisions,
+two-decision observation delay, architecture, SHA256, training seed, policy
+version, sampler settings, and training provenance. The loader validates these
+fields rather than inferring compatibility from dimensions alone.
 
-1. Implement a bounded pure-Go inference adapter and strict artifact loader.
-2. Export a frozen Python reference with a corpus of observations and expected
-   logits; compare Go output within a declared numeric tolerance.
-3. Verify action masking, sampling/argmax, delay and any recurrent state reset.
-4. Keep a deterministic seeded sampler if sampling is used. Do not use global RNG.
-5. Benchmark full25-room server workload within0.5CPU /256MB, not just matrix
-   multiplication. Record p99 tick latency, RSS, container memory and allocations.
-6. Evaluate held-out maps/opponents, stuck rate, idle time and spawn fairness.
+`difficulty` is required and must be exactly `trainee`, `expert`, or `ace`.
+These are three independent model artifacts; difficulty is not a runtime
+reaction-delay or physics modification. Synthetic/random parity fixtures are
+explicitly marked `trained:false`. The parity tool accepts such fixtures for
+verification; they are not trained opponents. `trained:true` records exporter
+provenance and does not establish gameplay quality.
+
+`internal/difficulty.LoadPolicies` checks all three release artifacts at startup,
+including `trained:true`, the exact SHA256, policy version and categorical
+sampler temperature (Trainee 1.0, Expert 0.3, Ace 0.5). A room shares the selected
+immutable actor and owns its per-tank RNG. The models are feed-forward; no
+recurrent state is used. Score multipliers live outside the simulation so they
+cannot alter training rewards or compound across snapshots.
+
+Release gates for future model changes:
+
+1. Validate each trainee/expert/ace checkpoint against a frozen Python reference
+   corpus, checking logits within a declared FP32 tolerance and checking legal
+   actions, sampler state, and the unchanged observation delay. The tooling is
+   implemented; new trained artifacts still require their own parity results.
+2. Evaluate held-out opponents/maps, stuck rate, idle time, spawn fairness, and
+   the intended difficulty ordering before selecting trained artifacts.
+3. Before a production capacity claim, benchmark the complete
+   25-room server under an enforced 0.5 CPU / 256 MB quota. Record p99 tick
+   latency, RSS, container memory, allocations, and throttling. A local matrix
+   multiplication benchmark does not satisfy this gate.
 
 ## Training design notes
 
-Use a rendering-free Go simulation with a batched Python bridge. Keep the Go
-rules and observation encoder authoritative, so a Python reimplementation cannot
-silently diverge. Start with curriculum tasks and shared enemy actor parameters,
-then use separate attacker/defender policies and a historical opponent pool.
-Training can use a larger critic or teacher and many parallel environments;
-deployment requires only the actor. No online learning occurs in a live room.
+The rendering-free Go simulation and batched binary IPC worker are implemented
+in `internal/training` and `cmd/trainenv`. They retain the Go rules and observation
+encoder rather than reimplementing physics in Python. An optional decision hook
+yields at the actual production barrier, including zero-enemy decisions; explicit
+reset/cancel/EOF releases suspended workers. See [the training protocol](TRAINING_PROTOCOL.md)
+for distinct defender and centralized critic encodings and reward semantics.
+
+The separate [no-warthunder-ai](https://github.com/1942ILSX/no-warthunder-ai)
+project provides the Python/PyTorch training pipeline, including shared enemy
+actors, a separate defender learner, and export and evaluation tooling.
+The bundled native-v3 actors completed training, evaluation and parity checks.
+Curriculum and historical opponent pools support the three independent
+difficulty artifacts. Training may use a larger critic or teacher and parallel
+environments; deployment requires only the exported actor. No online learning
+occurs in a live room.
 
 Score is not automatically an RL reward. Define training rewards independently:
 team victory/defeat should dominate, damage/death and potential-based navigation

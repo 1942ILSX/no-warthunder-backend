@@ -44,6 +44,10 @@ func (g *Game) SetPolicy(policy Policy) {
 
 func (g *Game) PolicyName() string { return g.policy.Name() }
 
+// Status avoids materializing a snapshot when an offline owner only needs to
+// detect episode completion. Like Step/Snapshot, calls must be serialized.
+func (g *Game) Status() string { return g.status }
+
 func (g *Game) SetInput(in Input) {
 	if in.Seq < g.input.Seq || g.status != "playing" {
 		return
@@ -99,8 +103,14 @@ func (g *Game) Step(dt float64) {
 	if g.decisionTimer <= 0 {
 		g.decisionTimer += 1.0 / DecisionHz
 		g.refreshNavigation()
-		for i := range g.enemies {
-			g.decide(&g.enemies[i])
+		if g.decisionHook != nil {
+			if !g.runDecisionHook() {
+				return // The offline owner cancelled this suspended step.
+			}
+		} else {
+			for i := range g.enemies {
+				g.decide(&g.enemies[i])
+			}
 		}
 	}
 	for i := range g.enemies {

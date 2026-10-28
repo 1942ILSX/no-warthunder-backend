@@ -3,9 +3,10 @@ package game
 import "math"
 
 const (
-	ObservationVersion = 1
-	ObservationSize    = 320
-	ActionCount        = 10
+	ObservationVersion   = 2
+	NormalizationVersion = 2
+	ObservationSize      = 320
+	ActionCount          = 10
 )
 
 // Observation is the deployment input contract, not training-only privileged
@@ -50,11 +51,11 @@ type PolicyMemory struct {
 	Hidden     [32]float32
 }
 
-// Policy is the replacement seam for a future pretrained actor. Decide must be
+// Policy is the interface shared by pretrained actors and reference bots. Decide must be
 // bounded, synchronous, deterministic for a supplied memory/observation pair,
 // and allocation-light. It cannot access sockets, player inputs, Game, or time.
-// Implement Name and Decide in a future model adapter, validate weights once at
-// load, and inject it via SetPolicy. No inference RPC is needed for a tiny MLP.
+// The model adapter validates weights once at load and is injected via SetPolicy.
+// No inference RPC is needed for the tiny MLP.
 type Policy interface {
 	Name() string
 	Decide(Observation, *PolicyMemory) Action
@@ -124,6 +125,16 @@ func (ScriptedPolicy) Decide(o Observation, m *PolicyMemory) Action {
 }
 
 func (g *Game) decide(t *tankState) {
+	o, ready := g.delayedObservation(t)
+	if !ready {
+		return
+	}
+	g.applyDecision(t, o, g.policy.Decide(o, &t.memory))
+}
+
+// delayedObservation is shared by production inference and the offline barrier.
+// Advancing this history anywhere else would add or remove reaction delay.
+func (g *Game) delayedObservation(t *tankState) (Observation, bool) {
 	current := g.observe(t)
 	// Two samples are a ~200 ms observation delay at10Hz. Empty initial history
 	// leaves a spawning tank idle, instead of granting an instant first reaction.
@@ -131,11 +142,14 @@ func (g *Game) decide(t *tankState) {
 		t.perception[t.perceptionCount] = current
 		t.perceptionCount++
 		t.action = Action{}
-		return
+		return Observation{}, false
 	}
 	o := t.perception[0]
 	t.perception[0], t.perception[1] = t.perception[1], current
-	a := g.policy.Decide(o, &t.memory)
+	return o, true
+}
+
+func (g *Game) applyDecision(t *tankState, o Observation, a Action) {
 	if a.Move < 0 || a.Move > 4 {
 		a = Action{}
 	}
@@ -204,8 +218,8 @@ func (g *Game) observe(t *tankState) Observation {
 	if visible {
 		v[208] = float32((g.player.X - t.X) / BoardSize)
 		v[209] = float32((g.player.Y - t.Y) / BoardSize)
-		v[210] = float32(g.playerVelocity[0] / PlayerSpeed)
-		v[211] = float32(g.playerVelocity[1] / PlayerSpeed)
+		v[210] = float32(max(-1, min(1, g.playerVelocity[0]/PlayerSpeed)))
+		v[211] = float32(max(-1, min(1, g.playerVelocity[1]/PlayerSpeed)))
 		v[212] = float32(g.player.HP)
 		v[213+g.player.Dir] = 1
 		v[217] = 1

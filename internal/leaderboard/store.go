@@ -3,6 +3,7 @@
 package leaderboard
 
 import (
+	"BattleCityReforge/internal/difficulty"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -24,6 +25,26 @@ type Record struct {
 	Score       int    `json:"score"`
 	DurationMS  int64  `json:"durationMs"`
 	CompletedAt string `json:"completedAt"`
+	RunMetadata
+}
+
+// Empty metadata identifies historical runs made before trained difficulties
+// were available. Never relabel those scores as a trained tier during loading.
+type RunMetadata struct {
+	Difficulty      difficulty.ID `json:"difficulty,omitempty"`
+	ScoreMultiplier float64       `json:"scoreMultiplier,omitempty"`
+	BaseScore       int           `json:"baseScore,omitempty"`
+}
+
+func (metadata RunMetadata) validate(score int) error {
+	if metadata == (RunMetadata{}) {
+		return nil
+	}
+	profile, ok := difficulty.Parse(string(metadata.Difficulty))
+	if !ok || metadata.BaseScore < 0 || metadata.ScoreMultiplier != profile.ScoreMultiplier || profile.ApplyScore(metadata.BaseScore) != score {
+		return errors.New("invalid difficulty score metadata")
+	}
+	return nil
 }
 
 type diskData struct {
@@ -67,6 +88,9 @@ func New(path string) (*Store, error) {
 			if _, err := time.Parse(time.RFC3339Nano, r.CompletedAt); err != nil {
 				return nil, errors.New("invalid leaderboard timestamp; original file preserved")
 			}
+			if err := r.RunMetadata.validate(r.Score); err != nil {
+				return nil, fmt.Errorf("invalid leaderboard metadata; original file preserved: %w", err)
+			}
 		}
 		sort.SliceStable(records, func(i, j int) bool { return better(records[i], records[j]) })
 		s.levels[level] = records
@@ -108,7 +132,7 @@ func (s *Store) Entries(level int) []Record {
 // Submit receives trusted score/time from the server's completion receipt, never
 // from the HTTP body. rank=0 means the run did not enter the top ten. IDs may
 // repeat because the leaderboard ranks runs, not unique players.
-func (s *Store) Submit(level int, id string, score int, durationMS int64, completed time.Time) (rank int, recorded bool, entries []Record, err error) {
+func (s *Store) Submit(level int, id string, score int, durationMS int64, completed time.Time, metadata ...RunMetadata) (rank int, recorded bool, entries []Record, err error) {
 	id, err = ValidateID(id)
 	if err != nil {
 		return
@@ -117,9 +141,20 @@ func (s *Store) Submit(level int, id string, score int, durationMS int64, comple
 		err = errors.New("invalid completed run")
 		return
 	}
+	var runMetadata RunMetadata
+	if len(metadata) > 1 {
+		err = errors.New("expected at most one run metadata value")
+		return
+	}
+	if len(metadata) == 1 {
+		runMetadata = metadata[0]
+	}
+	if err = runMetadata.validate(score); err != nil {
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	candidate := Record{ID: id, Score: score, DurationMS: durationMS, CompletedAt: completed.UTC().Format(time.RFC3339Nano)}
+	candidate := Record{ID: id, Score: score, DurationMS: durationMS, CompletedAt: completed.UTC().Format(time.RFC3339Nano), RunMetadata: runMetadata}
 	current := s.levels[level]
 	index := sort.Search(len(current), func(i int) bool { return better(candidate, current[i]) })
 	if index >= Limit {

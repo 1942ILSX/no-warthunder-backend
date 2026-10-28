@@ -5,3 +5,13 @@ bin
 *.prof
 *.test
 .env
+.env.*
+.envrc
+.direnv
+.vscode
+*.log
+*.pem
+*.key
+*.p12
+*.pfx
+.DS_Store
