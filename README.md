@@ -32,6 +32,30 @@ For a compiled server, run `go build -trimpath -o bin/no-warthunder .` and launc
 `./bin/no-warthunder` from the repository root. The default `models/` and
 `data/leaderboard.json` paths are relative to the working directory.
 
+## HTTPS and HTTP/3
+
+The same binary can serve HTTP/3 + WebTransport on UDP and HTTPS HTTP/2/1.1 +
+WebSocket fallback on TCP. Set `TLS_CERT_FILE` and `TLS_KEY_FILE` to a
+browser-trusted certificate pair; `HTTPS_ADDR` and `H3_ADDR` then default to
+`:443`. With neither certificate variable, `ADDR` retains the local HTTP mode.
+
+Optional production settings:
+
+| Variable | Purpose |
+| --- | --- |
+| `HTTP_ADDR` | Additional full-app HTTP listener; must use a loopback IP, e.g. `127.0.0.1:8080`, for a local reverse proxy. |
+| `REDIRECT_ADDR` | Optional HTTP redirect listener, e.g. `:80`; requires `PUBLIC_ORIGIN=https://game.example.com`. |
+| `FRONTEND_DIR` | Built frontend directory, identical to the files published under the CDN release root. |
+| `CDN_ASSET_BASE` | HTTPS CDN release root; empty disables CDN asset selection. |
+| `ORIGIN_SESSION_RATIO` | Origin asset cohort fraction, default `0.1`. API/game sessions always stay on origin. |
+
+Sending `SIGHUP` atomically reloads the certificate pair without restarting game
+sessions. A failed reload retains the existing certificate. The HTTPS listener
+advertises the configured H3 port with `Alt-Svc`. QUIC 0-RTT is disabled;
+connections, streams, receive windows, HTTP concurrency and state queues have
+explicit limits. CPU and memory quotas must still be enforced by the service
+manager and verified with the full transport workload.
+
 ## Verify
 
 ```sh
@@ -40,10 +64,11 @@ go test -race ./internal/server ./internal/leaderboard ./internal/policymlp
 go vet ./...
 ```
 
-The resource target is 0.5 CPU core and 256 MB RAM for 25 rooms. A bounded
-simulation/inference/JSON probe and local HTTP/WebSocket checks have passed;
-they do not constitute a sustained full-server test under that production
-quota. See [validation scope and results](docs/VALIDATION.md).
+The resource target is 0.5 CPU core and 256 MB RAM for 25 rooms. Use the
+[bounded transport probe](cmd/h3check/README.md) to check HTTP/3, WebTransport
+and HTTPS/WebSocket behavior, while measuring CPU and memory independently
+under the intended service limits. A successful protocol probe alone does not
+establish that resource budget.
 
 ## Project
 

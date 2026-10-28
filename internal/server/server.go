@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/gorilla/websocket"
+	"github.com/quic-go/webtransport-go"
 	"io"
 	"log/slog"
 	"net/http"
@@ -40,6 +41,10 @@ type Config struct {
 	AllowedOrigins []string
 	FrontendDir    string
 	Logger         *slog.Logger
+	// AssetBaseURL is the CDN release root. Empty keeps every session on origin.
+	AssetBaseURL     string
+	OriginAssetRatio float64
+	WebTransport     *webtransport.Server
 	// Policies are loaded once at startup and shared across rooms. A missing
 	// policy rejects room creation rather than silently changing its difficulty.
 	Policies map[difficulty.ID]game.Policy
@@ -54,6 +59,7 @@ type Server struct {
 	cancel   context.CancelFunc
 	wg       sync.WaitGroup
 	upgrader websocket.Upgrader
+	requests chan struct{}
 }
 type room struct {
 	id, token     string
@@ -117,7 +123,7 @@ func New(config Config, store *leaderboard.Store) *Server {
 		config.Logger = slog.Default()
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	s := &Server{config: config, store: store, rooms: make(map[string]*room), receipts: make(map[string]*receipt), ctx: ctx, cancel: cancel}
+	s := &Server{config: config, store: store, rooms: make(map[string]*room), receipts: make(map[string]*receipt), ctx: ctx, cancel: cancel, requests: make(chan struct{}, 64)}
 	s.upgrader = websocket.Upgrader{ReadBufferSize: 1024, WriteBufferSize: 4096, HandshakeTimeout: 5 * time.Second, CheckOrigin: s.validOrigin}
 	s.wg.Add(1)
 	go s.sweep()
@@ -134,6 +140,9 @@ func (s *Server) Close() {
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.health)
+	mux.HandleFunc("GET /api/client-config", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, 200, map[string]any{"assetBaseURL": s.config.AssetBaseURL, "originAssetRatio": s.config.OriginAssetRatio})
+	})
 	mux.HandleFunc("GET /api/difficulties", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{"defaultDifficulty": difficulty.Default, "difficulties": difficulty.All()})
 	})
@@ -142,11 +151,28 @@ func (s *Server) Handler() http.Handler {
 	})
 	mux.HandleFunc("POST /api/rooms", s.createRoom)
 	mux.HandleFunc("GET /api/rooms/{id}/ws", s.connect)
+	mux.HandleFunc("CONNECT /api/rooms/{id}/wt", s.connectWebTransport)
 	mux.HandleFunc("GET /api/leaderboard", s.getBoard)
 	mux.HandleFunc("POST /api/leaderboard", s.submit)
 	mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) { fail(w, 404, "not_found", "API endpoint not found") })
 	mux.HandleFunc("/", s.static)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// HTTP/3 does not inherit net/http.Server's request deadlines. Apply
+		// equivalent per-stream limits without timing out WebTransport sessions.
+		if r.Method != http.MethodConnect {
+			controller := http.NewResponseController(w)
+			_ = controller.SetReadDeadline(time.Now().Add(10 * time.Second))
+			_ = controller.SetWriteDeadline(time.Now().Add(10 * time.Second))
+		}
+		// Bound concurrent requests, including long-lived WebTransport sessions.
+		// The listener separately limits connections, so idle peers are bounded too.
+		select {
+		case s.requests <- struct{}{}:
+			defer func() { <-s.requests }()
+		default:
+			fail(w, 503, "server_unavailable", "Server is busy")
+			return
+		}
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Referrer-Policy", "same-origin")
 		if strings.HasPrefix(r.URL.Path, "/api/") || r.URL.Path == "/healthz" {
@@ -256,7 +282,11 @@ func (s *Server) createRoom(w http.ResponseWriter, r *http.Request) {
 	}
 	s.rooms[id] = &room{id: id, token: token, level: level, created: time.Now(), profile: profile, policy: policy, policyVersion: policyVersion}
 	s.mu.Unlock()
-	writeJSON(w, 201, map[string]any{"roomId": id, "token": token, "wsUrl": "/api/rooms/" + id + "/ws?token=" + token,
+	wtPath := ""
+	if s.config.WebTransport != nil {
+		wtPath = "/api/rooms/" + id + "/wt?token=" + token
+	}
+	writeJSON(w, 201, map[string]any{"roomId": id, "token": token, "wsUrl": "/api/rooms/" + id + "/ws?token=" + token, "webTransportPath": wtPath,
 		"difficulty": profile.ID, "scoreMultiplier": profile.ScoreMultiplier, "policyVersion": policyVersion})
 }
 func (s *Server) connect(w http.ResponseWriter, r *http.Request) {
@@ -288,16 +318,13 @@ func (s *Server) connect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer conn.Close()
-	s.runRoom(conn, rm)
+	s.runRoom(newWebSocketConnection(conn), rm)
 }
-func (s *Server) runRoom(conn *websocket.Conn, rm *room) {
+func (s *Server) runRoom(conn roomConnection, rm *room) {
 	ctx, cancel := context.WithCancel(s.ctx)
 	defer cancel()
 	inputs := make(chan game.Input, 32)
 	readDone := make(chan struct{})
-	conn.SetReadLimit(512)
-	_ = conn.SetReadDeadline(time.Now().Add(45 * time.Second))
-	conn.SetPongHandler(func(string) error { return conn.SetReadDeadline(time.Now().Add(45 * time.Second)) })
 	go func() {
 		defer close(readDone)
 		var previous uint64
@@ -342,7 +369,6 @@ func (s *Server) runRoom(conn *websocket.Conn, rm *room) {
 	g.SetPolicy(rm.policy)
 	started := time.Now()
 	send := func(message any) bool {
-		_ = conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
 		return conn.WriteJSON(message) == nil
 	}
 	if !send(map[string]any{"type": "welcome", "roomId": rm.id, "level": rm.level, "state": rm.state(g.Snapshot()),
@@ -369,14 +395,17 @@ func (s *Server) runRoom(conn *websocket.Conn, rm *room) {
 			sequence = input.Seq
 			lastInput = time.Now()
 		case <-ping.C:
-			if err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(time.Second)); err != nil {
+			if err := conn.Ping(); err != nil {
 				return
 			}
 		case now := <-ticker.C:
 			if now.Sub(started) > roomTTL {
 				state := g.Snapshot()
 				state.Status = "lost"
-				send(map[string]any{"type": "finished", "result": rm.result(state, now.Sub(started).Milliseconds())})
+				state.TimeMS = now.Sub(started).Milliseconds()
+				if send(map[string]any{"type": "finished", "state": rm.state(state), "result": rm.result(state, state.TimeMS)}) {
+					conn.Finish()
+				}
 				return
 			}
 			if now.Sub(lastInput) > 500*time.Millisecond {
@@ -398,7 +427,7 @@ func (s *Server) runRoom(conn *websocket.Conn, rm *room) {
 			}
 			state := g.Snapshot()
 			state.TimeMS = now.Sub(started).Milliseconds()
-			if !send(map[string]any{"type": "state", "state": rm.state(state)}) {
+			if conn.WriteState(map[string]any{"type": "state", "state": rm.state(state)}) != nil {
 				return
 			}
 			if state.Status != "playing" {
@@ -415,8 +444,8 @@ func (s *Server) runRoom(conn *websocket.Conn, rm *room) {
 						s.mu.Unlock()
 					}
 				}
-				send(map[string]any{"type": "finished", "result": final})
-				_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, "Run complete"), time.Now().Add(time.Second))
+				send(map[string]any{"type": "finished", "state": rm.state(state), "result": final})
+				conn.Finish()
 				return
 			}
 		}
@@ -518,6 +547,11 @@ func (s *Server) static(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-cache")
 		http.ServeFile(w, r, filepath.Join(s.config.FrontendDir, "index.html"))
 		return
+	}
+	if strings.HasPrefix(r.URL.Path, "/assets/") {
+		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+	} else {
+		w.Header().Set("Cache-Control", "no-cache")
 	}
 	http.FileServer(http.Dir(s.config.FrontendDir)).ServeHTTP(w, r)
 }

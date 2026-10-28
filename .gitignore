@@ -20,6 +20,10 @@ coverage.out
 *.p12
 *.pfx
 
+# Private deployment configuration and host-specific validation reports
+/deploy/
+/docs/VALIDATION_HTTP3_*.md
+
 # Operating system artifacts
 .DS_Store
 ._*

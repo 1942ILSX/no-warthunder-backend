@@ -18,7 +18,7 @@ rating describes the fixed map, independently of the selected opponent model.
 ## Session
 
 `POST /api/rooms` body `{levelId:number,difficulty?:Difficulty}` → HTTP 201
-`{roomId:string,token:string,wsUrl:string,difficulty:Difficulty,scoreMultiplier:number,policyVersion:string}`.
+`{roomId:string,token:string,wsUrl:string,webTransportPath:string,difficulty:Difficulty,scoreMultiplier:number,policyVersion:string}`.
 Omitting difficulty selects Expert; an unknown/empty string is rejected.
 The room locks its selected model and multiplier until it ends.
 
@@ -27,6 +27,25 @@ The websocket URL is a relative path `/api/rooms/{roomId}/ws?token=...`. Only on
 Level IDs, scores, player IDs and protocol values are language-independent. Level metadata is canonical English; the frontend translates names, subtitles and descriptions by level ID for `en`, `zh_cn` and `jp`. Locale selection does not alter a room or its simulation.
 
 Client WebSocket message: `{type:"input",seq:integer,move:0..4,fire:boolean}`. Sequence increases monotonically. Send at ≤20 Hz plus immediate input changes; server accepts a bounded rate. No client coordinates, score, time or collision outcomes are trusted.
+
+When TLS/H3 is enabled, `webTransportPath` is the relative endpoint
+`/api/rooms/{roomId}/wt?token=...`; it is empty in plain HTTP development mode.
+The browser prefers WebTransport over HTTP/3, opening one bidirectional stream
+and sending one newline-delimited JSON (NDJSON) `{type:"join"}` message. Only
+this explicit join claims the room and starts gameplay. Before sending join,
+the browser may cancel and use `wsUrl` with the same reservation. After join,
+disconnect abandons the run; this release does not implement runtime resume.
+
+The bidirectional stream carries input NDJSON toward the server and
+`welcome` / `finished` control messages toward the browser. The server opens
+one unidirectional stream carrying `state` NDJSON. Each client message is at
+most 512 bytes; server messages are at most 64 KiB. Snapshot sending retains
+one latest pending full state and disconnects a writer stalled for two seconds.
+There is no ordering guarantee between streams: apply welcome before snapshots,
+ignore late snapshots after finished, and use the final state included with
+finished. After processing finished, send `{type:"finishedAck"}` on the
+bidirectional stream before closing. The server waits up to one second for this
+acknowledgement so session closure cannot overtake the final event.
 
 Server greeting: `{type:"welcome",roomId:string,level:Level,state:State,difficulty:Difficulty,scoreMultiplier:number,policyVersion:string}`.
 
@@ -41,7 +60,7 @@ game/training core retains only the raw score; transport adapts a copy.
 
 Tank: `{id:number,x:number,y:number,dir:0..3,hp:number,maxHp:number,kind:"player"|"scout"|"striker"|"heavy",shield:boolean}`. Bullet: `{id:number,x:number,y:number,dir:0..3,owner:"player"|"enemy"}`. Effect: `{id:number,x:number,y:number,kind:"hit"|"explosion"|"spawn",ttl:number}` (ttl in seconds).
 
-Server final event: `{type:"finished",result:{status:"won"|"lost",levelId:number,score:number,baseScore:number,difficulty:Difficulty,scoreMultiplier:number,policyVersion:string,durationMs:number,kills:number,completionToken?:string}}`. A victory earns a single-use completion token, valid for 10 minutes. Player can decline submission. Closing or losing connection abandons an unfinished run. There is no pause; ranked elapsed time comes from the server monotonic wall clock. State.timeMs in transport snapshots uses this same clock; the headless engine separately tracks deterministic simulation time.
+Server final event: `{type:"finished",state:State,result:{status:"won"|"lost",levelId:number,score:number,baseScore:number,difficulty:Difficulty,scoreMultiplier:number,policyVersion:string,durationMs:number,kills:number,completionToken?:string}}`. A victory earns a single-use completion token, valid for 10 minutes. Player can decline submission. Closing or losing connection abandons an unfinished run. There is no pause; ranked elapsed time comes from the server monotonic wall clock. State.timeMs in transport snapshots uses this same clock; the headless engine separately tracks deterministic simulation time.
 
 ## Records
 
@@ -52,6 +71,13 @@ Record: `{id:string,score:number,durationMs:number,completedAt:string,difficulty
 `POST /api/leaderboard` body `{completionToken:string,id:string}` → `{rank:number|null,recorded:boolean,entries:Record[]}`. Server derives level, score, duration and difficulty metadata from the token; no client-provided score, multiplier or difficulty is accepted. Results rank by weighted score descending, then durationMs ascending, then completedAt ascending. Each level has one Top 10 shared by all difficulties, at most 100 records total. Submission is explicit, and token reuse is rejected.
 
 `GET /healthz` → `{status:"ok",activeRooms:number,maxRooms:number}`.
+
+`GET /api/client-config` → `{assetBaseURL:string,originAssetRatio:number}`.
+The base URL is the HTTPS CDN release root, with a trailing slash; an empty URL
+means origin only. A browser session chooses one asset location before loading
+the application; `originAssetRatio=0.1` selects origin for 10% of sessions in
+expectation, not exactly 10% of requests or transferred bytes. HTML and API
+remain on origin in both cohorts. This response is `Cache-Control: no-store`.
 
 ## Local development
 
